@@ -1,19 +1,17 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -g
+CFLAGS = -std=gnu99 -Wall -Wextra -g
 
-all: oss worker
+TARGETS = oss worker
 
-oss: oss.o
-	$(CC) $(CFLAGS) -o oss oss.o
+all: $(TARGETS)
 
-worker: worker.o
-	$(CC) $(CFLAGS) -o worker worker.o
+oss: oss.c
+	$(CC) $(CFLAGS) oss.c -o oss
 
-oss.o: oss.c
-	$(CC) $(CFLAGS) -c oss.c
-
-worker.o: worker.c
-	$(CC) $(CFLAGS) -c worker.c
+worker: worker.c
+	$(CC) $(CFLAGS) worker.c -o worker
 
 clean:
-	rm -f *.o oss worker oss.log
+	rm -f $(TARGETS) *.o
+
+.PHONY: all clean

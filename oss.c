@@ -1,613 +1,453 @@
-/*
- * oss.c - Master process for OS Simulator
- * Manages child worker processes, resource allocation, and deadlock detection/recovery.
- */
+// oss.c
+// Master simulator: resource management with deadlock detection & recovery
 
- #include <stdio.h>
- #include <stdlib.h>
- #include <unistd.h>
- #include <sys/types.h>
- #include <sys/ipc.h>
- #include <sys/shm.h>
- #include <sys/msg.h>
- #include <sys/wait.h>
- #include <signal.h>
- #include <string.h>
- #include <errno.h>
- #include <time.h>
- #include <stdbool.h>
- 
- #define SHMKEY 0x98765        // Shared memory key
- #define MSGKEY 0x12345        // Message queue key
- 
- #define MAX_PROCESSES 100
- #define RES_TYPES 5
- #define INSTANCES_PER_RES 10
- 
- // Message structure for communication between OSS and workers
- typedef struct {
-     long mtype;             // Message type (for msgrcv/msqsnd)
-     int action;             // Action code (request, release, etc.)
-     int resource;           // Resource ID (0-4)
-     int quantity;           // Quantity of resource
-     unsigned int time;      // Simulated time used (nanoseconds)
-     pid_t pid;              // Sender PID (for identification)
- } Message;
- 
- // Action codes for messages (worker -> OSS)
- #define ACTION_REQUEST   1
- #define ACTION_RELEASE   2
- #define ACTION_TERMINATE 3
- #define ACTION_NOOP      4
- // Action codes for messages (OSS -> worker)
- #define ACTION_DISPATCH  1
- #define ACTION_GRANT     2
- #define ACTION_KILL      3
- 
- // Shared memory and message queue identifiers
- int shmid = -1;
- int msqid = -1;
- unsigned int *shmClock = NULL;  // [0] = seconds, [1] = nanoseconds
- FILE *logFile = NULL;
- bool verbose = false;
- 
- // Simulation parameters
- int totalProcesses = 0;
- int maxConcurrent = 0;
- unsigned int quantum_ns = 0;   // Time slice bound B in nanoseconds
- 
- // Process control structure
- typedef struct {
-     bool active;
-     bool blocked;
-     pid_t pid;
-     unsigned int alloc[RES_TYPES];  // Resources allocated to this process
-     int requestRes;    // Resource requested if blocked (-1 if none)
-     int requestAmt;
- } ProcInfo;
- 
- ProcInfo procTable[MAX_PROCESSES];
- int activeCount = 0;
- int launchedCount = 0;
- int terminatedCount = 0;
- 
- // Resource availability (instances currently available for each of 5 resources)
- unsigned int available[RES_TYPES];
- 
- // Statistics counters
- unsigned long totalRequests = 0;
- unsigned long totalReleases = 0;
- unsigned long requestsGrantedImmediately = 0;
- unsigned long requestsBlocked = 0;
- unsigned long deadlockDetections = 0;
- unsigned long deadlocksResolved = 0;
- unsigned long processesKilledForDeadlock = 0;
- 
- // Cleanup function to release IPC resources and kill children
- void cleanup(int sig) {
-     (void)sig;
-     // Terminate all active children
-     for(int i = 0; i < MAX_PROCESSES; ++i) {
-         if(procTable[i].active) {
-             kill(procTable[i].pid, SIGTERM);
-         }
-     }
-     // Remove message queue
-     if(msqid != -1) msgctl(msqid, IPC_RMID, NULL);
-     // Detach and remove shared memory
-     if(shmClock != NULL && shmClock != (void*)-1) shmdt(shmClock);
-     if(shmid != -1) shmctl(shmid, IPC_RMID, NULL);
-     if(logFile) fclose(logFile);
-     exit(0);
- }
- 
- /* Deadlock detection algorithm (runs every simulated second):
-  * Marks non-blocked processes as safe, then checks which blocked processes can proceed.
-  * Identifies processes in deadlock and terminates one holding the most resources to break the deadlock.
-  */
- void detectDeadlock() {
-     bool finish[MAX_PROCESSES];
-     unsigned int work[RES_TYPES];
-     // Initialize work as current available resources
-     for(int r = 0; r < RES_TYPES; ++r) {
-         work[r] = available[r];
-     }
-     // Initialize finish for each process
-     for(int i = 0; i < MAX_PROCESSES; ++i) {
-         if(procTable[i].active) {
-             if(procTable[i].blocked) {
-                 finish[i] = false;  // blocked processes not finished
-             } else {
-                 finish[i] = true;   // not blocked -> can finish
-                 // Assume it will complete and free its resources
-                 for(int r = 0; r < RES_TYPES; ++r) {
-                     work[r] += procTable[i].alloc[r];
-                 }
-             }
-         } else {
-             finish[i] = true; // not active
-         }
-     }
-     // Try to find processes that can finish (even if initially blocked)
-     bool progress = true;
-     while(progress) {
-         progress = false;
-         for(int i = 0; i < MAX_PROCESSES; ++i) {
-             if(procTable[i].active && !finish[i]) {
-                 int res = procTable[i].requestRes;
-                 int amt = procTable[i].requestAmt;
-                 // If this blocked process's request can be satisfied with current work
-                 if(res >= 0 && (unsigned int)amt <= work[res]) {
-                     finish[i] = true;
-                     progress = true;
-                     // Release its allocated resources into work
-                     for(int r = 0; r < RES_TYPES; ++r) {
-                         work[r] += procTable[i].alloc[r];
-                     }
-                 }
-             }
-         }
-     }
-     // Identify deadlocked processes (those still not finished)
-     int deadlockedProcs[MAX_PROCESSES];
-     int deadCount = 0;
-     for(int i = 0; i < MAX_PROCESSES; ++i) {
-         if(procTable[i].active && !finish[i]) {
-             deadlockedProcs[deadCount++] = i;
-         }
-     }
-     if(deadCount > 0) {
-         deadlockDetections++;
-         if(verbose) {
-             fprintf(logFile ? logFile : stdout,
-                     "OSS: Deadlock detected at time %u:%u involving %d process(es).\n",
-                     shmClock[0], shmClock[1], deadCount);
-             if(logFile) fflush(logFile);
-         }
-         // Select victim to terminate (process holding the most resources)
-         unsigned int maxHeld = 0;
-         int victimIndex = -1;
-         for(int k = 0; k < deadCount; ++k) {
-             int idx = deadlockedProcs[k];
-             unsigned int held = 0;
-             for(int r = 0; r < RES_TYPES; ++r) {
-                 held += procTable[idx].alloc[r];
-             }
-             if(held >= maxHeld) {
-                 maxHeld = held;
-                 victimIndex = idx;
-             }
-         }
-         if(victimIndex >= 0) {
-             processesKilledForDeadlock++;
-             if(verbose) {
-                 fprintf(logFile ? logFile : stdout,
-                         "OSS: Terminating process P%d (PID %d) to resolve deadlock.\n",
-                         victimIndex, procTable[victimIndex].pid);
-                 if(logFile) fflush(logFile);
-             }
-             // Send termination message to victim
-             Message msg;
-             msg.mtype   = procTable[victimIndex].pid;
-             msg.action  = ACTION_KILL;
-             msg.resource= -1;
-             msg.quantity= 0;
-             msg.time    = 0;
-             msg.pid     = 0;
-             if(msgsnd(msqid, &msg, sizeof(Message)-sizeof(long), 0) == -1) {
-                 perror("oss: msgsnd ACTION_KILL");
-             }
-             // Free all resources held by victim (simulate immediate reclaim)
-             for(int r = 0; r < RES_TYPES; ++r) {
-                 if(procTable[victimIndex].alloc[r] > 0) {
-                     available[r] += procTable[victimIndex].alloc[r];
-                     procTable[victimIndex].alloc[r] = 0;
-                 }
-             }
-             procTable[victimIndex].blocked = false;
-             procTable[victimIndex].requestRes = -1;
-             procTable[victimIndex].requestAmt = 0;
-             deadlocksResolved++;
-         }
-     }
- }
- 
- // Find an available slot in procTable for a new process
- int findFreeSlot() {
-     for(int i = 0; i < MAX_PROCESSES; ++i) {
-         if(!procTable[i].active) {
-             return i;
-         }
-     }
-     return -1;
- }
- 
- int main(int argc, char *argv[]) {
-     // Default parameters
-     totalProcesses = 5;
-     maxConcurrent = 2;
-     quantum_ns = 100000000;  // 0.1 second default quantum
- 
-     // Parse command-line options
-     int opt;
-     while((opt = getopt(argc, argv, "n:s:b:vh")) != -1) {
-         switch(opt) {
-             case 'n':
-                 totalProcesses = atoi(optarg);
-                 break;
-             case 's':
-                 maxConcurrent = atoi(optarg);
-                 break;
-             case 'b':
-                 quantum_ns = (unsigned int) atol(optarg);
-                 break;
-             case 'v':
-                 verbose = true;
-                 break;
-             case 'h':
-             default:
-                 fprintf(stderr, "Usage: %s [-n total_procs] [-s concurrent] [-b nanosec_bound] [-v]\n", argv[0]);
-                 exit(1);
-         }
-     }
-     if(totalProcesses < 1) totalProcesses = 1;
-     if(maxConcurrent < 1) maxConcurrent = 1;
-     if(maxConcurrent > MAX_PROCESSES) maxConcurrent = MAX_PROCESSES;
-     if(totalProcesses > MAX_PROCESSES) totalProcesses = MAX_PROCESSES;
- 
-     // Open log file (if verbose, log all events)
-     logFile = fopen("oss.log", "w");
-     if(!logFile) {
-         perror("oss: fopen log");
-         logFile = NULL; // fallback to stdout
-     }
- 
-     // Set up shared memory for simulated clock
-     shmid = shmget(SHMKEY, 2 * sizeof(unsigned int), IPC_CREAT | 0666);
-     if(shmid == -1) {
-         perror("oss: shmget");
-         cleanup(0);
-     }
-     shmClock = (unsigned int *) shmat(shmid, NULL, 0);
-     if(shmClock == (void *) -1) {
-         perror("oss: shmat");
-         cleanup(0);
-     }
-     shmClock[0] = 0;
-     shmClock[1] = 0;
- 
-     // Set up message queue
-     msqid = msgget(MSGKEY, IPC_CREAT | 0666);
-     if(msqid == -1) {
-         perror("oss: msgget");
-         cleanup(0);
-     }
- 
-     // Initialize resource availability and process table
-     for(int r = 0; r < RES_TYPES; ++r) {
-         available[r] = INSTANCES_PER_RES;
-     }
-     for(int i = 0; i < MAX_PROCESSES; ++i) {
-         procTable[i].active = false;
-         procTable[i].blocked = false;
-         procTable[i].pid = 0;
-         procTable[i].requestRes = -1;
-         procTable[i].requestAmt = 0;
-         for(int r = 0; r < RES_TYPES; ++r) {
-             procTable[i].alloc[r] = 0;
-         }
-     }
- 
-     // Set up signal handler for graceful termination (Ctrl+C)
-     signal(SIGINT, cleanup);
- 
-     // Launch initial worker processes (up to maxConcurrent or totalProcesses)
-     srand(time(NULL));
-     for(int count = 0; count < maxConcurrent && count < totalProcesses; ++count) {
-         int slot = findFreeSlot();
-         if(slot == -1) break;
-         pid_t pid = fork();
-         if(pid < 0) {
-             perror("oss: fork");
-             break;
-         }
-         if(pid == 0) {
-             // In child process: execute worker
-             char argB[32];
-             sprintf(argB, "%u", quantum_ns);
-             execl("./worker", "worker", argB, (char *)NULL);
-             perror("oss: execl worker");
-             exit(1);
-         } else {
-             // In parent (OSS)
-             procTable[slot].active = true;
-             procTable[slot].blocked = false;
-             procTable[slot].pid = pid;
-             procTable[slot].requestRes = -1;
-             procTable[slot].requestAmt = 0;
-             for(int r = 0; r < RES_TYPES; ++r) {
-                 procTable[slot].alloc[r] = 0;
-             }
-             activeCount++;
-             launchedCount++;
-             if(verbose) {
-                 fprintf(logFile ? logFile : stdout,
-                         "OSS: Launched process P%d (PID %d)\n", slot, pid);
-                 if(logFile) fflush(logFile);
-             }
-         }
-     }
- 
-     unsigned int lastDeadlockCheckSec = 0;
-     /* Main simulation loop */
-     while(terminatedCount < totalProcesses) {
-         Message msg;
-         bool messageProcessed = false;
-         // Process all messages from workers (non-blocking receive)
-         while(msgrcv(msqid, &msg, sizeof(Message) - sizeof(long), 1, IPC_NOWAIT) != -1) {
-             messageProcessed = true;
-             // Identify which process sent this message (by PID field)
-             pid_t wp = msg.pid;
-             int procIndex = -1;
-             for(int i = 0; i < MAX_PROCESSES; ++i) {
-                 if(procTable[i].active && procTable[i].pid == wp) {
-                     procIndex = i;
-                     break;
-                 }
-             }
-             if(procIndex == -1) {
-                 continue; // unknown process (should not happen)
-             }
-             // Advance simulated time by the CPU time used from message
-             unsigned int addTime = msg.time;
-             shmClock[1] += addTime;
-             if(shmClock[1] >= 1000000000) {
-                 shmClock[0] += shmClock[1] / 1000000000;
-                 shmClock[1] %= 1000000000;
-             }
-             // Handle message based on action code
-             if(msg.action == ACTION_REQUEST) {
-                 totalRequests++;
-                 int res = msg.resource;
-                 int amt = msg.quantity;
-                 if(verbose) {
-                     fprintf(logFile ? logFile : stdout,
-                             "OSS: P%d (PID %d) requesting R%d (%d units) at time %u:%u\n",
-                             procIndex, wp, res, amt, shmClock[0], shmClock[1]);
-                     if(logFile) fflush(logFile);
-                 }
-                 if(amt <= (int)available[res]) {
-                     // Resource available -> grant immediately
-                     available[res] -= amt;
-                     procTable[procIndex].alloc[res] += amt;
-                     Message grantMsg;
-                     grantMsg.mtype    = wp;
-                     grantMsg.action   = ACTION_GRANT;
-                     grantMsg.resource = res;
-                     grantMsg.quantity = amt;
-                     grantMsg.time     = 0;
-                     grantMsg.pid      = 0;
-                     if(msgsnd(msqid, &grantMsg, sizeof(Message) - sizeof(long), 0) == -1) {
-                         perror("oss: msgsnd grant");
-                     }
-                     if(verbose) {
-                         fprintf(logFile ? logFile : stdout,
-                                 "OSS: Granted R%d (%d units) to P%d (PID %d)\n",
-                                 res, amt, procIndex, wp);
-                         if(logFile) fflush(logFile);
-                     }
-                     requestsGrantedImmediately++;
-                     procTable[procIndex].blocked = false;
-                     procTable[procIndex].requestRes = -1;
-                     procTable[procIndex].requestAmt = 0;
-                 } else {
-                     // Not enough available -> block the process
-                     procTable[procIndex].blocked = true;
-                     procTable[procIndex].requestRes = res;
-                     procTable[procIndex].requestAmt = amt;
-                     requestsBlocked++;
-                     if(verbose) {
-                         fprintf(logFile ? logFile : stdout,
-                                 "OSS: P%d (PID %d) is blocked waiting for R%d (%d units)\n",
-                                 procIndex, wp, res, amt);
-                         if(logFile) fflush(logFile);
-                     }
-                     // No response sent; worker will block waiting for grant
-                 }
-             } else if(msg.action == ACTION_RELEASE) {
-                 totalReleases++;
-                 int res = msg.resource;
-                 int amt = msg.quantity;
-                 // Release resources held by process
-                 if(procTable[procIndex].alloc[res] < (unsigned int)amt) {
-                     amt = procTable[procIndex].alloc[res];
-                 }
-                 procTable[procIndex].alloc[res] -= amt;
-                 available[res] += amt;
-                 if(verbose) {
-                     fprintf(logFile ? logFile : stdout,
-                             "OSS: P%d (PID %d) released R%d (%d units) at time %u:%u\n",
-                             procIndex, wp, res, amt, shmClock[0], shmClock[1]);
-                     if(logFile) fflush(logFile);
-                 }
-                 // Check if any blocked process can now be granted its request
-                 for(int i = 0; i < MAX_PROCESSES; ++i) {
-                     if(procTable[i].active && procTable[i].blocked) {
-                         int reqRes = procTable[i].requestRes;
-                         int reqAmt = procTable[i].requestAmt;
-                         if(reqRes >= 0 && (unsigned int)reqAmt <= available[reqRes]) {
-                             // We can satisfy this request now
-                             available[reqRes] -= reqAmt;
-                             procTable[i].alloc[reqRes] += reqAmt;
-                             // Unblock the process
-                             procTable[i].blocked = false;
-                             procTable[i].requestRes = -1;
-                             procTable[i].requestAmt = 0;
-                             // Send grant message
-                             Message grantMsg;
-                             grantMsg.mtype    = procTable[i].pid;
-                             grantMsg.action   = ACTION_GRANT;
-                             grantMsg.resource = reqRes;
-                             grantMsg.quantity = reqAmt;
-                             grantMsg.time     = 0;
-                             grantMsg.pid      = 0;
-                             if(msgsnd(msqid, &grantMsg, sizeof(Message)-sizeof(long), 0) == -1) {
-                                 perror("oss: msgsnd grant (release unblock)");
-                             }
-                             if(verbose) {
-                                 fprintf(logFile ? logFile : stdout,
-                                         "OSS: Granted R%d (%d units) to P%d (PID %d) [unblocked]\n",
-                                         reqRes, reqAmt, i, procTable[i].pid);
-                                 if(logFile) fflush(logFile);
-                             }
-                         }
-                     }
-                 }
-             } else if(msg.action == ACTION_TERMINATE) {
-                 // Worker signals it is terminating
-                 if(verbose) {
-                     fprintf(logFile ? logFile : stdout,
-                             "OSS: P%d (PID %d) has terminated at time %u:%u\n",
-                             procIndex, wp, shmClock[0], shmClock[1]);
-                     if(logFile) fflush(logFile);
-                 }
-                 // Mark process as terminated (will be cleaned up by waitpid)
-                 procTable[procIndex].active = false;
-             } else if(msg.action == ACTION_NOOP) {
-                 // Process used entire time slice without resource events
-                 if(verbose) {
-                     fprintf(logFile ? logFile : stdout,
-                             "OSS: P%d (PID %d) used full time slice at time %u:%u\n",
-                             procIndex, wp, shmClock[0], shmClock[1]);
-                     if(logFile) fflush(logFile);
-                 }
-             }
-         }
-         // Deadlock detection check every simulated second
-         if(shmClock[0] > lastDeadlockCheckSec) {
-             lastDeadlockCheckSec = shmClock[0];
-             detectDeadlock();
-         }
-         // If no message processed and processes are idle/blocked, advance time to trigger deadlock check
-         if(!messageProcessed && activeCount > 0) {
-             unsigned int inc = 100000000; // 100ms
-             if(shmClock[0] == lastDeadlockCheckSec) {
-                 if(shmClock[1] + inc >= 1000000000) {
-                     shmClock[0] += 1;
-                     shmClock[1] = 0;
-                 } else {
-                     shmClock[1] += inc;
-                 }
-             }
-         }
-         // Check for any finished child processes (non-blocking wait)
-         int status = 0;
-         pid_t pid;
-         while((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-             // Find which process ended
-             int idx = -1;
-             for(int i = 0; i < MAX_PROCESSES; ++i) {
-                 if(procTable[i].active && procTable[i].pid == pid) {
-                     idx = i;
-                     break;
-                 }
-             }
-             if(idx == -1) {
-                 // If not marked active (perhaps already set inactive on terminate message)
-                 for(int i = 0; i < MAX_PROCESSES; ++i) {
-                     if(procTable[i].pid == pid) {
-                         idx = i;
-                         break;
-                     }
-                 }
-             }
-             if(idx != -1) {
-                 // Free any resources still allocated to this process
-                 for(int r = 0; r < RES_TYPES; ++r) {
-                     if(procTable[idx].alloc[r] > 0) {
-                         available[r] += procTable[idx].alloc[r];
-                         procTable[idx].alloc[r] = 0;
-                     }
-                 }
-                 // Clear blocked status and pending request if any
-                 procTable[idx].blocked = false;
-                 procTable[idx].requestRes = -1;
-                 procTable[idx].requestAmt = 0;
-                 procTable[idx].active = false;
-                 activeCount--;
-                 terminatedCount++;
-                 if(verbose) {
-                     fprintf(logFile ? logFile : stdout,
-                             "OSS: Cleaned up P%d (PID %d). Total terminated: %d\n",
-                             idx, pid, terminatedCount);
-                     if(logFile) fflush(logFile);
-                 }
-             }
-             // Launch a new process if we still have more to start
-             if(launchedCount < totalProcesses && activeCount < maxConcurrent) {
-                 int slot = findFreeSlot();
-                 if(slot != -1) {
-                     pid_t npid = fork();
-                     if(npid < 0) {
-                         perror("oss: fork");
-                     } else if(npid == 0) {
-                         char argB[32];
-                         sprintf(argB, "%u", quantum_ns);
-                         execl("./worker", "worker", argB, (char*)NULL);
-                         perror("oss: execl new worker");
-                         exit(1);
-                     } else {
-                         procTable[slot].active = true;
-                         procTable[slot].blocked = false;
-                         procTable[slot].pid = npid;
-                         procTable[slot].requestRes = -1;
-                         procTable[slot].requestAmt = 0;
-                         for(int r = 0; r < RES_TYPES; ++r) {
-                             procTable[slot].alloc[r] = 0;
-                         }
-                         activeCount++;
-                         launchedCount++;
-                         if(verbose) {
-                             fprintf(logFile ? logFile : stdout,
-                                     "OSS: Launched new process P%d (PID %d)\n",
-                                     slot, npid);
-                             if(logFile) fflush(logFile);
-                         }
-                     }
-                 }
-             }
-         }
-         // Dispatch all active and ready (not blocked) processes for the next time slice
-         for(int i = 0; i < MAX_PROCESSES; ++i) {
-             if(procTable[i].active && !procTable[i].blocked) {
-                 Message dispatchMsg;
-                 dispatchMsg.mtype    = procTable[i].pid;
-                 dispatchMsg.action   = ACTION_DISPATCH;
-                 dispatchMsg.resource = -1;
-                 dispatchMsg.quantity = 0;
-                 dispatchMsg.time     = quantum_ns;
-                 dispatchMsg.pid      = 0;
-                 if(msgsnd(msqid, &dispatchMsg, sizeof(Message) - sizeof(long), 0) == -1) {
-                     perror("oss: msgsnd dispatch");
-                 }
-             }
-         }
-     }
- 
-     // Simulation done - output summary statistics
-     fprintf(logFile ? logFile : stdout, "\nOSS: Simulation complete. Statistics:\n");
-     fprintf(logFile ? logFile : stdout, "Total processes: %d (max concurrent %d)\n", totalProcesses, maxConcurrent);
-     fprintf(logFile ? logFile : stdout, "Total resource requests: %lu (granted immediately: %lu, blocked: %lu)\n",
-             totalRequests, requestsGrantedImmediately, requestsBlocked);
-     fprintf(logFile ? logFile : stdout, "Total resource releases: %lu\n", totalReleases);
-     fprintf(logFile ? logFile : stdout, "Deadlock occurrences detected: %lu\n", deadlockDetections);
-     fprintf(logFile ? logFile : stdout, "Processes terminated to resolve deadlocks: %lu\n", processesKilledForDeadlock);
- 
-     if(logFile) fclose(logFile);
-     // Cleanup IPC resources
-     msgctl(msqid, IPC_RMID, NULL);
-     shmdt(shmClock);
-     shmctl(shmid, IPC_RMID, NULL);
-     return 0;
- }
- 
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+#include <unistd.h>
+#include <time.h>
+#include <signal.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/msg.h>
+#include <sys/wait.h>
+#include <unistd.h>      // for fork(), getopt(), optarg, usleep()
+#include <getopt.h>  
+
+#define RESOURCE_COUNT          5
+#define INSTANCES_PER_RESOURCE 10
+#define MAX_ACTIVE_PROCS       18
+
+// default tuning parameters
+#define CLOCK_INCREMENT_NS 100000000  // 0.1s per loop
+#define PRINT_TABLE_NS     500000000  // 0.5s
+#define DEADLOCK_NS       1000000000  // 1.0s
+#define REAL_TIME_LIMIT      5        // seconds
+
+// message types
+#define REQ_TYPE  1
+#define RES_TYPE(pid) (pid)
+
+// request kinds
+#define REQUEST     0
+#define RELEASE_ONE 1
+#define RELEASE_ALL 2
+
+typedef struct {
+    long mtype;
+    pid_t pid;
+    int kind;
+    int resource_id;
+} msg_t;
+
+typedef struct {
+    long mtype;
+    int resource_id;
+} grant_t;
+
+typedef struct {
+    unsigned int sec;
+    unsigned int ns;
+} shm_clock_t;
+
+typedef struct {
+    int total;
+    int available;
+} resource_t;
+
+typedef struct {
+    pid_t pid;
+    int in_use;
+    int allocated[RESOURCE_COUNT];
+    int waiting;
+    int req_res;
+} pcb_t;
+
+typedef struct {
+    int total_reqs;
+    int immediate_grants;
+    int delayed_reqs;
+    int deadlock_runs;
+    int procs_killed;
+    int procs_terminated_normally;
+} stats_t;
+
+static int shm_id = -1, msg_id = -1;
+static shm_clock_t *clk = NULL;
+static resource_t resources[RESOURCE_COUNT];
+static pcb_t proc_tbl[MAX_ACTIVE_PROCS];
+static stats_t stats;
+static FILE *logfp = NULL;
+
+// helper: log to stdout and logfile
+void log_event(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stdout, fmt, ap);
+    fprintf(stdout, "\n");
+    if (logfp) {
+        va_start(ap, fmt);
+        vfprintf(logfp, fmt, ap);
+        fprintf(logfp, "\n");
+    }
+    va_end(ap);
+}
+
+// increment shared clock by ns, rolling seconds
+void increment_clock(unsigned int ns) {
+    clk->ns += ns;
+    while (clk->ns >= 1000000000U) {
+        clk->sec++;
+        clk->ns -= 1000000000U;
+    }
+}
+
+// print resource & process table
+void print_tables() {
+    log_event("---- Resource Table at %u:%09u ----", clk->sec, clk->ns);
+    for (int i = 0; i < RESOURCE_COUNT; i++) {
+        log_event("R%d: %d available / %d total",
+                  i, resources[i].available, resources[i].total);
+    }
+    log_event("---- Process Table ----");
+    for (int i = 0; i < MAX_ACTIVE_PROCS; i++) {
+        if (!proc_tbl[i].in_use) continue;
+        printf("PID %d:", proc_tbl[i].pid);
+        if (logfp) fprintf(logfp, "PID %d:", proc_tbl[i].pid);
+        for (int r = 0; r < RESOURCE_COUNT; r++) {
+            printf(" R%d=%d", r, proc_tbl[i].allocated[r]);
+            if (logfp) fprintf(logfp, " R%d=%d", r, proc_tbl[i].allocated[r]);
+        }
+        printf("\n");
+        if (logfp) fprintf(logfp, "\n");
+    }
+}
+
+// find pcb entry by pid
+pcb_t* find_pcb(pid_t pid) {
+    for (int i = 0; i < MAX_ACTIVE_PROCS; i++)
+        if (proc_tbl[i].in_use && proc_tbl[i].pid == pid)
+            return &proc_tbl[i];
+    return NULL;
+}
+
+// try granting outstanding requests
+void check_waiting() {
+    for (int i = 0; i < MAX_ACTIVE_PROCS; i++) {
+        if (!proc_tbl[i].in_use || !proc_tbl[i].waiting) continue;
+        int rid = proc_tbl[i].req_res;
+        if (resources[rid].available > 0) {
+            // allocate
+            resources[rid].available--;
+            proc_tbl[i].allocated[rid]++;
+            proc_tbl[i].waiting = 0;
+            stats.immediate_grants++;  // count as grant after wait
+            // send grant
+            grant_t g = { .mtype = proc_tbl[i].pid, .resource_id = rid };
+            msgsnd(msg_id, &g, sizeof(g) - sizeof(long), 0);
+            log_event("Master granting delayed request PID %d R%d at %u:%09u",
+                      proc_tbl[i].pid, rid, clk->sec, clk->ns);
+        }
+    }
+}
+
+// detect deadlock via simple wait-for graph cycle detection
+// returns number of pids found, array filled with them
+int detect_deadlock(pid_t out[]) {
+    int n = 0;
+    // build wait-for adjacency matrix
+    int waiting[MAX_ACTIVE_PROCS] = {0};
+    int held_by[RESOURCE_COUNT][MAX_ACTIVE_PROCS] = {{0}};
+    int proc_index[MAX_ACTIVE_PROCS];
+    // map active entries to index
+    int m = 0;
+    for (int i = 0; i < MAX_ACTIVE_PROCS; i++) {
+        if (proc_tbl[i].in_use) proc_index[m++] = i;
+    }
+    // who holds each resource?
+    for (int k = 0; k < m; k++) {
+        int i = proc_index[k];
+        for (int r = 0; r < RESOURCE_COUNT; r++) {
+            if (proc_tbl[i].allocated[r] > 0)
+                held_by[r][k] = 1;
+        }
+        if (proc_tbl[i].waiting) waiting[k] = 1;
+    }
+    // build wait-for edges
+    int adj[m][m];
+    memset(adj, 0, sizeof(adj));
+    for (int k = 0; k < m; k++) {
+        if (!waiting[k]) continue;
+        int rid = proc_tbl[proc_index[k]].req_res;
+        for (int j = 0; j < m; j++) {
+            if (held_by[rid][j]) adj[k][j] = 1;
+        }
+    }
+    // detect cycle with DFS
+    int visited[m], stack[m];
+    memset(visited, 0, sizeof(visited));
+    memset(stack,   0, sizeof(stack));
+    // lambda DFS
+    int found = 0;
+    void dfs(int u) {
+        if (found) return;
+        visited[u] = 1; stack[u] = 1;
+        for (int v = 0; v < m; v++) {
+            if (!adj[u][v]) continue;
+            if (!visited[v]) dfs(v);
+            else if (stack[v]) {
+                // cycle: collect all in stack
+                for (int x = 0; x < m; x++) {
+                    if (stack[x]) {
+                        out[n++] = proc_tbl[proc_index[x]].pid;
+                    }
+                }
+                found = 1;
+                return;
+            }
+        }
+        stack[u] = 0;
+    }
+    for (int k = 0; k < m && !found; k++)
+        if (!visited[k] && waiting[k])
+            dfs(k);
+
+    return n;
+}
+
+// choose victim: highest pid
+pid_t choose_victim(pid_t pids[], int count) {
+    pid_t best = pids[0];
+    for (int i = 1; i < count; i++)
+        if (pids[i] > best) best = pids[i];
+    return best;
+}
+
+// free all resources of pcb, mark removed
+void cleanup_pcb(pid_t pid, int killed) {
+    pcb_t *p = find_pcb(pid);
+    if (!p) return;
+    // release allocs
+    int freed_any = 0;
+    for (int r = 0; r < RESOURCE_COUNT; r++) {
+        if (p->allocated[r] > 0) {
+            resources[r].available += p->allocated[r];
+            freed_any = 1;
+        }
+    }
+    if (freed_any) {
+        log_event("Master freed resources of PID %d at %u:%09u",
+                  pid, clk->sec, clk->ns);
+    }
+    if (killed) stats.procs_killed++;
+    else         stats.procs_terminated_normally++;
+    p->in_use = 0;
+}
+
+// clean up shared IPC
+void cleanup_ipc(int sig) {
+    if (clk) shmdt(clk);
+    if (shm_id >= 0) shmctl(shm_id, IPC_RMID, NULL);
+    if (msg_id >= 0) msgctl(msg_id, IPC_RMID, NULL);
+    if (logfp) fclose(logfp);
+    exit(0);
+}
+
+int main(int argc, char *argv[]) {
+    int opt;
+    int n_max = 5;
+    unsigned int sim_limit = 20;      // simulated seconds
+    unsigned int launch_i_ms = 250;   // ms
+    unsigned int bound_ns = 100000000; // worker B
+    char *logfile = NULL;
+
+    while ((opt = getopt(argc, argv, "hn:s:i:b:f:")) != -1) {
+        switch(opt) {
+        case 'h': printf("Usage: oss [-n maxproc] [-s simsec] [-i launch_ms] "
+                         "[-b bound_ns] [-f logfile]\n"); return 0;
+        case 'n': n_max = atoi(optarg); break;
+        case 's': sim_limit = atoi(optarg); break;
+        case 'i': launch_i_ms = atoi(optarg); break;
+        case 'b': bound_ns = atoi(optarg); break;
+        case 'f': logfile = optarg; break;
+        default:  fprintf(stderr,"Unknown option\n"); exit(1);
+        }
+    }
+    if (!logfile) {
+        fprintf(stderr, "Must specify -f logfile\n"); exit(1);
+    }
+    logfp = fopen(logfile, "w");
+    if (!logfp) { perror("fopen"); exit(1); }
+
+    signal(SIGINT, cleanup_ipc);
+    signal(SIGTERM, cleanup_ipc);
+
+    // setup shared clock
+    key_t shm_key = ftok(".", 'c');
+    shm_id = shmget(shm_key, sizeof(shm_clock_t), IPC_CREAT|0666);
+    clk = shmat(shm_id, NULL, 0);
+    clk->sec = clk->ns = 0;
+
+    // setup message queue
+    key_t msg_key = ftok(".", 'q');
+    msg_id = msgget(msg_key, IPC_CREAT|0666);
+
+    // init resources & proc table
+    for (int i = 0; i < RESOURCE_COUNT; i++) {
+        resources[i].total = INSTANCES_PER_RESOURCE;
+        resources[i].available = INSTANCES_PER_RESOURCE;
+    }
+    memset(&proc_tbl, 0, sizeof(proc_tbl));
+    memset(&stats,    0, sizeof(stats));
+
+    unsigned int launch_interval_ns = launch_i_ms * 1000000U;
+    unsigned int next_launch_time = 0;
+    unsigned int last_print = 0, last_deadlock = 0;
+    int total_launched = 0, active = 0;
+    time_t real_start = time(NULL);
+    int allow_launch = 1;
+
+    // main loop
+    while ((total_launched < n_max && allow_launch) || active > 0) {
+        // real-time stop launching
+        if (difftime(time(NULL), real_start) > REAL_TIME_LIMIT)
+            allow_launch = 0;
+
+        increment_clock(CLOCK_INCREMENT_NS);
+
+        // reap any terminated child
+        int status;
+        pid_t pid = waitpid(-1, &status, WNOHANG);
+        if (pid > 0) {
+            cleanup_pcb(pid, WIFSIGNALED(status));
+            active--;
+            check_waiting();
+        }
+
+        // possibly launch new worker
+        unsigned int cur_ns = clk->sec * 1000000000U + clk->ns;
+        if (allow_launch && total_launched < n_max && active < MAX_ACTIVE_PROCS
+         && cur_ns >= next_launch_time) {
+            pid_t c = fork();
+            if (c < 0) { perror("fork"); }
+            else if (c == 0) {
+                // child → exec worker
+                char bn[32];
+                snprintf(bn, sizeof(bn), "%u", bound_ns);
+                execl("./worker", "worker", "-b", bn, NULL);
+                perror("execl"); _exit(1);
+            } else {
+                // parent
+                // find free slot
+                for (int i = 0; i < MAX_ACTIVE_PROCS; i++) {
+                    if (!proc_tbl[i].in_use) {
+                        proc_tbl[i].in_use = 1;
+                        proc_tbl[i].pid    = c;
+                        for (int r = 0; r < RESOURCE_COUNT; r++)
+                            proc_tbl[i].allocated[r] = 0;
+                        proc_tbl[i].waiting = 0;
+                        break;
+                    }
+                }
+                total_launched++; active++;
+                next_launch_time = cur_ns + launch_interval_ns;
+                log_event("Master launched PID %d at %u:%09u",
+                          c, clk->sec, clk->ns);
+            }
+        }
+
+        // grant any waiting if possible
+        check_waiting();
+
+        // handle incoming requests/releases
+        msg_t m;
+        if (msgrcv(msg_id, &m, sizeof(m)-sizeof(long), REQ_TYPE,
+                   IPC_NOWAIT) > 0) {
+            stats.total_reqs++;
+            pcb_t *p = find_pcb(m.pid);
+            if (!p) continue;
+            switch (m.kind) {
+            case REQUEST:
+                log_event("Master detected PID %d REQUEST R%d at %u:%09u",
+                          m.pid, m.resource_id, clk->sec, clk->ns);
+                if (resources[m.resource_id].available > 0) {
+                    // grant immediately
+                    resources[m.resource_id].available--;
+                    p->allocated[m.resource_id]++;
+                    stats.immediate_grants++;
+                    grant_t g = { .mtype = m.pid,
+                                  .resource_id = m.resource_id };
+                    msgsnd(msg_id, &g, sizeof(g)-sizeof(long), 0);
+                    log_event("Master granting PID %d R%d at %u:%09u",
+                              m.pid, m.resource_id, clk->sec, clk->ns);
+                } else {
+                    // block
+                    p->waiting    = 1;
+                    p->req_res    = m.resource_id;
+                    stats.delayed_reqs++;
+                    log_event("Master blocking PID %d on R%d at %u:%09u",
+                              m.pid, m.resource_id, clk->sec, clk->ns);
+                }
+                break;
+            case RELEASE_ONE:
+                resources[m.resource_id].available++;
+                p->allocated[m.resource_id]--;
+                log_event("Master detected PID %d RELEASE R%d at %u:%09u",
+                          m.pid, m.resource_id, clk->sec, clk->ns);
+                check_waiting();
+                break;
+            case RELEASE_ALL:
+                log_event("Master detected PID %d RELEASING ALL at %u:%09u",
+                          m.pid, clk->sec, clk->ns);
+                cleanup_pcb(m.pid, 0);
+                active--;
+                check_waiting();
+                break;
+            }
+        }
+
+        // periodic table print
+        cur_ns = clk->sec * 1000000000U + clk->ns;
+        if (cur_ns - last_print >= PRINT_TABLE_NS) {
+            print_tables();
+            last_print = cur_ns;
+        }
+
+        // periodic deadlock detect
+        if (cur_ns - last_deadlock >= DEADLOCK_NS) {
+            stats.deadlock_runs++;
+            pid_t dead[ MAX_ACTIVE_PROCS ];
+            int dn = detect_deadlock(dead);
+            if (dn > 0) {
+                log_event("Master running deadlock detection at %u:%09u: found %d",
+                          clk->sec, clk->ns, dn);
+                // kill one victim at a time until resolved
+                while (dn > 0) {
+                    pid_t victim = choose_victim(dead, dn);
+                    log_event("Master terminating PID %d to resolve deadlock", victim);
+                    kill(victim, SIGTERM);
+                    // wait for reap in next iteration
+                    sleep(0);  
+                    dn = detect_deadlock(dead);
+                }
+            }
+            last_deadlock = cur_ns;
+        }
+        // busy‐wait a tiny bit
+        usleep(1000);
+    }
+
+    // final stats
+    log_event("=== Simulation complete at %u:%09u ===", clk->sec, clk->ns);
+    log_event("Total requests: %d", stats.total_reqs);
+    log_event("Immediate grants: %d", stats.immediate_grants);
+    log_event("Delayed grants: %d", stats.delayed_reqs);
+    log_event("Deadlock checks: %d", stats.deadlock_runs);
+    log_event("Processes killed by deadlock: %d", stats.procs_killed);
+    log_event("Processes terminated normally: %d",
+              stats.procs_terminated_normally);
+
+    cleanup_ipc(0);
+    return 0;
+}
