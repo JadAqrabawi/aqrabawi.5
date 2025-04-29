@@ -1,0 +1,81 @@
+fsck
+
+fsck /dev/sda1
+
+jadaqrabawi7@gmail.com
+Dublin1200#
+
+git config --global user.name "jadaqrabawi"
+git config --global user.email "jadaqrabawi7@gmail.com"
+
+echo "# aqrabawi.1" >> README.md
+git init
+git add README.md
+git commit -m "first commit"
+git branch -M main
+git remote add origin https://github.com/Jadaqrabawi/aqrabawi.1.git
+git push -u origin main
+
+Jmagm4@umsytem.edu
+
+delmar.umsl.edu
+
+Jmagm4
+Haneen2003
+
+
+ssh aqrabawi@opsys.cs.umsl.edu
+
+ssh aqrabawi@hoare.cs.umsl.edu
+
+cp -p -r aqrabawi.4 /home/hauschildm/cs4760/assignment4
+
+
+18252517
+aqrabawi
+
+mkdir aqrabawi.1
+cd aqrabawi.1
+
+
+cat > oss.c << 'EOF'
+
+
+cat > worker.c << 'EOF'
+
+
+cat > Makefile << 'EOF'
+
+
+directory called aqrabawi.1
+
+make clean && make all
+
+./oss 
+
+./worker 5 500000
+
+./oss -n 10 -s 3 -t 7 -i 100
+
+./oss -n 20 -s 3 -t 10 -i 50
+
+./oss -n 20 -s 5 -t 7 -i 100 -f oss.log
+
+
+chmod 700 aqrabawi.1
+
+cp -p -r aqrabawi.1 /home/kali
+
+make clean
+
+Submission
+
+1. Source files *(c,noted)
+2. README
+3. Makefile
+4. .git subdirectory
+5. Results (screenshoot)
+
+README file should consist:
+1. A description of how to compile and run your project
+2. Other important information
