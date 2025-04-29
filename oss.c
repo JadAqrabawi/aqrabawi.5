@@ -247,12 +247,14 @@ void cleanup_pcb(pid_t pid, int killed) {
 
 // clean up shared IPC
 void cleanup_ipc(int sig) {
+    (void)sig;  // Mark the parameter as intentionally unused
     if (clk) shmdt(clk);
     if (shm_id >= 0) shmctl(shm_id, IPC_RMID, NULL);
     if (msg_id >= 0) msgctl(msg_id, IPC_RMID, NULL);
     if (logfp) fclose(logfp);
     exit(0);
 }
+
 
 int main(int argc, char *argv[]) {
     int opt;
