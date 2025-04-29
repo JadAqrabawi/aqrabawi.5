@@ -1,18 +1,19 @@
-# Compiler and flags
 CC = gcc
-CFLAGS = -Wall -g
+CFLAGS = -Wall -Wextra -g
 
-# Build both oss and worker executables
 all: oss worker
 
-# Build oss executable from oss.c
-oss: oss.c
-	$(CC) $(CFLAGS) -o oss oss.c
+oss: oss.o
+	$(CC) $(CFLAGS) -o oss oss.o
 
-# Build worker executable from worker.c
-worker: worker.c
-	$(CC) $(CFLAGS) -o worker worker.c
+worker: worker.o
+	$(CC) $(CFLAGS) -o worker worker.o
 
-# Clean up generated files
+oss.o: oss.c
+	$(CC) $(CFLAGS) -c oss.c
+
+worker.o: worker.c
+	$(CC) $(CFLAGS) -c worker.c
+
 clean:
-	rm -f oss worker *.o oss.log
+	rm -f *.o oss worker oss.log
